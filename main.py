@@ -1,19 +1,45 @@
 import requests
 import json
+import configparser
 from tqdm import tqdm
+from datetime import datetime
 
+# Чтение конфигурационного файла
+config = configparser.ConfigParser()
+config.read('settings.ini')
 
-class ParsingFromVKToYaDisk:
-    API_URL_VK = 'https://api.vk.com/method/photos.get'
-    API_URL_YA = 'https://cloud-api.yandex.net/v1/disk/resources/upload'
+# Получение токенов из конфигурационного файла
+VKtoken = config["VK"]["token"]
+YAtoken = config["Yandex"]["token"]
+VK_id = config["VK"]["id_vk"]
 
-    def __init__(self, user_id_vk, token_ya, token_vk, count_photo=5):
-        self.user_id_vk = user_id_vk
-        self.token_ya = token_ya
-        self.token_vk = token_vk
+class VK:
+    def __init__(self, token, version, count_photo=5):
+        self.token = token
+        self.version = version
         self.count_photo = count_photo
 
-    def get_photos_data(self):
+    def get_owner_id(self):
+        # Получение ID пользователя VK
+        owner_input = input('Введите ID или screen_name целевого профиля VK: ')
+        try:
+            owner_id = int(owner_input)
+        except ValueError:
+            # Если введен screen_name, получаем его id через API VK
+            response = requests.get('https://api.vk.com/method/utils.resolveScreenName', params={
+                'screen_name': owner_input,
+                'access_token': self.token,
+                'v': self.version
+            }).json()
+            owner_id = response['response']['object_id']
+        return owner_id
+
+    def get_photo(self):
+        # Получение фотографий из VK API
+        owner_id = self.get_owner_id()
+
+        url = 'https://api.vk.com/method/photos.get'
+
         question = input('По умолчанию загрузится 5 фотографий. Хотите изменить количество фотографий? (да/нет): ')
         if question.lower() == 'да':
             self.count_photo = int(input('Введите количество фотографий: '))
@@ -25,91 +51,95 @@ class ParsingFromVKToYaDisk:
             album = input('Введено некорректное значение. Попробуйте ещё раз: ')
 
         params = {
-            'owner_id': self.user_id_vk,
+            'owner_id': owner_id,
+            'access_token': self.token,
+            'v': self.version,
+            'extended': '1',
             'album_id': album,
-            'extended': 1,
-            'count': self.count_photo,
-            'photo_sizes': 1,
-            'access_token': self.token_vk,
-            'v': '5.199'
+            'photo_sizes': '1',
+            'sort': '1',
+            'offset': '0',
+            'count': self.count_photo
         }
 
-        response = requests.get(self.API_URL_VK, params=params)
-        photos_list_info = response.json().get('response', {}).get('items')
+        response = requests.get(url, params=params).json()
 
-        return photos_list_info
+        dict_photo = {}
+        if 'response' in response and 'items' in response['response']:
+            for item in response['response']['items']:
+                likes = item.get('likes', {}).get('count', 0)
+                sizes = item.get('sizes', [])
+                for size in sizes:
+                    if size.get('type') == 'z':
+                        dict_photo[likes] = size.get('url', '')
+        return dict_photo
 
-    def create_folder_on_yad(self):
-        name_folder = input('Введите название папки на Яндекс Диске, в которую загрузить фотографии: ')
-        url_folder = f'https://cloud-api.yandex.net/v1/disk/resources'
-        headers = {
-            'Authorization': f'OAuth {self.token_ya}'
+
+class YandexDisk:
+    def __init__(self, token):
+        self.token = token
+
+    def get_headers(self):
+        # Получение заголовков для запросов к API Яндекс.Диска
+        return {
+            'Content-Type': 'application/json',
+            'Authorization': 'OAuth {}'.format(self.token)
         }
-        params = {
-            'path': name_folder
-        }
 
-        requests.put(url_folder, headers=headers, params=params)
+    def create_folder_on_yadisk(self, disk_folder_path):
+        # Создание папки на Яндекс.Диске
+        upload_url = "https://cloud-api.yandex.net/v1/disk/resources"
+        headers = self.get_headers()
+        response = requests.put(f'{upload_url}?path={disk_folder_path}', headers=headers)
+        if response.status_code == 201:
+            print(f'Создана папка {disk_folder_path} на Яндекс.Диске')
 
-        return name_folder
+    def get_upload_link(self, disk_file_path):
+        # Получение ссылки для загрузки файла на Яндекс.Диск
+        upload_url = "https://cloud-api.yandex.net/v1/disk/resources/upload"
+        headers = self.get_headers()
+        params = {"path": disk_file_path, "overwrite": "true"}
+        response = requests.get(upload_url, headers=headers, params=params)
+        return response.json()
 
-    def _save_info_in_json(self, data, count_photo):
-        with open('data_file.json', 'w', encoding='utf-8') as file:
-            json.dump(data, file, ensure_ascii=False, indent=4)
-        print(f'Данные о {count_photo} загруженных фото сохранены в "data_file.json".')
+    def upload_file_to_disk(self, disk_file_path, content):
+        # Загрузка файла на Яндекс.Диск
+        href = self.get_upload_link(disk_file_path=disk_file_path).get("href", "")
+        response = requests.put(href, data=content)
+        response.raise_for_status()
 
-    def uploadind_fotos_to_yad(self, photo_list):
-        if len(photo_list) == 0:
-            print('В этом альбоме нет фотографий!')
-            self._save_info_in_json(photo_list, 0)
-            return
 
-        photo_list_info_for_json = []
-        folder_name = self.create_folder_on_yad()
-        list_names = []
+def write_data_to_json(photo_dict):
+    # Запись данных о фотографиях в JSON файл
+    data = []
+    for likes, url in photo_dict.items():
+        data.append({"likes": likes, "url": url})
 
-        for i, photo in tqdm(enumerate(photo_list), total=len(photo_list)):
-            photo_name = f"{photo.get('likes', {}).get('count')}.jpg"
-            if photo_name in list_names:
-                photo_name = f"{photo.get('likes', {}).get('count')}_{photo.get('id')}.jpg"
-            list_names.append(photo_name)
+    with open("data_files.json", "w") as json_file:
+        json.dump(data, json_file, indent=4)
+    print("Информация о загруженных фотографиях записана в файл data_files.json")
 
-            url = self.API_URL_YA
-            headers = {
-                'Authorization': f'OAuth {self.token_ya}'
-            }
-            params = {
-                'path': f'{folder_name}/{photo_name}',
-            }
 
-            response = requests.get(url, params=params, headers=headers)
-            url_upload = response.json().get('href')
+def download_and_save_photos(photo_dict):
+    # Загрузка и сохранение фотографий на Яндекс.Диск
+    ya = YandexDisk(token=YAtoken)
+    path = input(f'Введите название папки на Яндекс.Диске: ')
+    ya.create_folder_on_yadisk(path)
 
-            url_max_size = ''
-            size = ''
-            max_size = 0
+    for likes, url in tqdm(photo_dict.items(), desc="Загрузка фотографий"):
+        content = requests.get(url).content
+        current_date = datetime.now().strftime("%d-%m-%Y")
+        ya.upload_file_to_disk(f"{path}/{likes}_likes_{current_date}.jpg", content)
 
-            for elem in photo.get('sizes'):
-                if int(elem.get('height')) * int(elem.get('width')) > max_size:
-                    url_max_size = elem.get('url')
-                    size = elem.get('type')
-                    max_size = int(elem.get('height')) * int(elem.get('width'))
+    write_data_to_json(photo_dict)
 
-            response = requests.get(url_max_size)
-            requests.put(url_upload, files={'file': response.content})
 
-            photo_list_info_for_json.append({
-                'file_name': photo_name,
-                'size': size
-            })
+def main():
+    # Основная функция
+    vk = VK(VKtoken, '5.199')
+    photo_dict = vk.get_photo()
+    download_and_save_photos(photo_dict)
 
-        self._save_info_in_json(photo_list_info_for_json, len(photo_list_info_for_json))
 
-user_id_vk_ = input('Введите id пользователя VK: ')
-token_vk_ = input('Введите токен VK: ')
-token_ya_ = input('Введите токен полигона Яндекс.Диск: ')
-
-if __name__ == '__main__':
-    new_object = ParsingFromVKToYaDisk(user_id_vk_, token_ya_, token_vk_)
-    photo_info = new_object.get_photos_data()
-    new_object.uploadind_fotos_to_yad(photo_info)
+if __name__ == "__main__":
+    main()
